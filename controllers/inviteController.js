@@ -1,23 +1,33 @@
 const config = require('../config/config');
-const User = require('../models/User');
-const DriverInvite = require('../models/DriverInvite');
 const membershipUtils = require('../utils/membershipUtils');
+const { v4: uuidv4 } = require('uuid');
 
 /**
  * Create a trial invite link for a user
  * @param {Object} bot Bot object
  * @param {Number} userId User's Telegram ID
  * @param {String} fullName User's full name
+ * @param {Object} redisClient Redis client
  * @returns {Promise<String|null>} Created invite link or null
  */
-const createTrialInviteLink = async (bot, userId, fullName) => {
+const createTrialInviteLink = async (bot, userId, fullName, redisClient) => {
   try {
     // Check if user already has an active invite
-    const existingInvite = await DriverInvite.findOne({
-      telegramId: userId,
-      status: 'active',
-      type: 'trial'
-    });
+    const inviteIds = await redisClient.sMembers(`invites:user:${userId}`);
+    let existingInvite = null;
+    for (const inviteId of inviteIds) {
+      const invite = await redisClient.hGetAll(`invite:${inviteId}`);
+      if (invite.status === 'active' && invite.type === 'trial') {
+        existingInvite = {
+          id: inviteId,
+          ...invite,
+          telegramId: parseInt(invite.telegramId),
+          createdAt: new Date(parseInt(invite.createdAt)),
+          expiresAt: invite.expiresAt ? new Date(parseInt(invite.expiresAt)) : undefined
+        };
+        break;
+      }
+    }
 
     if (existingInvite) {
       // Check if the existing invite is still valid (not expired)
@@ -28,8 +38,7 @@ const createTrialInviteLink = async (bot, userId, fullName) => {
         return existingInvite.inviteLink;
       } else {
         // Mark old invite as expired
-        existingInvite.status = 'expired';
-        await existingInvite.save();
+        await redisClient.hSet(`invite:${existingInvite.id}`, 'status', 'expired');
       }
     }
 
@@ -57,16 +66,22 @@ const createTrialInviteLink = async (bot, userId, fullName) => {
     });
 
     // Save invite information
-    const newInvite = new DriverInvite({
-      telegramId: userId,
+    const inviteId = uuidv4();
+    const newInvite = {
+      telegramId: userId.toString(),
       fullName,
       inviteLink: inviteLink.invite_link,
       type: 'trial',
       status: 'active',
-      expiresAt: new Date(Date.now() + 10 * 1000) // 10 seconds from now
-    });
+      createdAt: Date.now().toString(),
+      expiresAt: (Date.now() + 10 * 1000).toString()
+    };
 
-    await newInvite.save();
+    await redisClient.hSet(`invite:${inviteId}`, newInvite);
+    await redisClient.sAdd(`invites:user:${userId}`, inviteId);
+    await redisClient.set(`invitelink:${inviteLink.invite_link}`, inviteId, { EX: 10 });
+    await redisClient.sAdd('invites', inviteId);
+
     return inviteLink.invite_link;
   } catch (error) {
     console.error('Error creating trial invite link:', error);
@@ -79,13 +94,14 @@ const createTrialInviteLink = async (bot, userId, fullName) => {
  * @param {Object} bot Bot object
  * @param {Number} userId User's Telegram ID
  * @param {String} inviteId Optional invite ID to confirm
+ * @param {Object} redisClient Redis client
  * @returns {Promise<String|null>} Created invite link or null
  */
-const createPaymentInviteLink = async (bot, userId, inviteId = null) => {
+const createPaymentInviteLink = async (bot, userId, inviteId = null, redisClient) => {
   try {
     // Get user
-    const user = await User.findOne({ telegramId: userId });
-    if (!user) {
+    const user = await redisClient.hGetAll(`user:${userId}`);
+    if (Object.keys(user).length === 0) {
       throw new Error('User not found');
     }
 
@@ -113,23 +129,29 @@ const createPaymentInviteLink = async (bot, userId, inviteId = null) => {
     });
 
     // Save invite information
-    const newInvite = new DriverInvite({
-      telegramId: userId,
+    const newInviteId = uuidv4();
+    const newInvite = {
+      telegramId: userId.toString(),
       fullName: user.fullName,
       inviteLink: inviteLink.invite_link,
       type: 'payment',
       status: 'active',
-      expiresAt: new Date(Date.now() + 15 * 1000) // 15 seconds from now
-    });
+      createdAt: Date.now().toString(),
+      expiresAt: (Date.now() + 15 * 1000).toString()
+    };
 
-    await newInvite.save();
+    await redisClient.hSet(`invite:${newInviteId}`, newInvite);
+    await redisClient.sAdd(`invites:user:${userId}`, newInviteId);
+    await redisClient.set(`invitelink:${inviteLink.invite_link}`, newInviteId, { EX: 15 });
+    await redisClient.sAdd('invites', newInviteId);
 
     // If inviteId is provided, confirm the payment
     if (inviteId) {
       const confirmResult = await membershipUtils.confirmPaymentAndCreateInvite(
         userId,
         inviteId,
-        createTrialInviteLink
+        (bot, userId, fullName) => createTrialInviteLink(bot, userId, fullName, redisClient),
+        redisClient
       );
 
       if (!confirmResult.success) {
@@ -148,4 +170,4 @@ const createPaymentInviteLink = async (bot, userId, inviteId = null) => {
 module.exports = {
   createTrialInviteLink,
   createPaymentInviteLink
-}; 
+};

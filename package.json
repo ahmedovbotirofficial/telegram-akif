@@ -18,7 +18,8 @@
     "mongoose": "^8.13.2",
     "node-fetch": "^2.7.0",
     "node-telegram-bot-api": "^0.66.0",
-    "redis": "^5.0.1"
+    "redis": "^5.0.1",
+    "uuid": "^9.0.1"
   },
   "devDependencies": {
     "nodemon": "^3.1.9"

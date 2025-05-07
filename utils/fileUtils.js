@@ -30,7 +30,7 @@ const saveTelegramPhoto = async (bot, fileId, userId) => {
     const fileName = `${userId}_${timestamp}.jpg`;
     
     // Foydalanuvchi papkasini yaratish
-    const userDir = path.join(__dirname, '..', 'uploads', 'payments', userId.toString());
+    const userDir = path.join(__dirname, '..', 'Uploads', 'payments', userId.toString());
     await fs.ensureDir(userDir);
     
     // Fayl yo'lini olish
@@ -56,7 +56,7 @@ const saveTelegramPhoto = async (bot, fileId, userId) => {
  */
 const getUserPhotos = async (userId) => {
   try {
-    const userDir = path.join(__dirname, '..', 'uploads', 'payments', userId.toString());
+    const userDir = path.join(__dirname, '..', 'Uploads', 'payments', userId.toString());
     
     // Agar papka mavjud bo'lsa, rasmlarni olish
     if (await fs.pathExists(userDir)) {
@@ -78,4 +78,4 @@ const getUserPhotos = async (userId) => {
 module.exports = {
   saveTelegramPhoto,
   getUserPhotos
-}; 
+};

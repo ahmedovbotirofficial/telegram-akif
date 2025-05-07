@@ -1,16 +1,14 @@
-const User = require('../models/User');
-const DriverInvite = require('../models/DriverInvite');
-
 /**
  * Check if a user is in trial period
  * @param {Number} userId User's Telegram ID
+ * @param {Object} redisClient Redis client
  * @returns {Promise<Object>} Trial status and seconds left
  */
-const checkTrialPeriod = async (userId) => {
+const checkTrialPeriod = async (userId, redisClient) => {
   try {
-    const user = await User.findOne({ telegramId: userId });
+    const user = await redisClient.hGetAll(`user:${userId}`);
     
-    if (!user) {
+    if (Object.keys(user).length === 0) {
       return { isTrialActive: false, secondsLeft: 0 };
     }
     
@@ -18,7 +16,7 @@ const checkTrialPeriod = async (userId) => {
     if (user.countdownIntervalId) {
       // Calculate remaining time based on when the user joined
       const now = new Date();
-      const joinTime = user.lastInteraction || now;
+      const joinTime = user.lastInteraction ? new Date(parseInt(user.lastInteraction)) : now;
       const elapsedSeconds = Math.floor((now - joinTime) / 1000);
       
       // For trial period, 10 seconds
@@ -51,18 +49,21 @@ const checkTrialPeriod = async (userId) => {
 /**
  * Check if an invite link is valid
  * @param {String} inviteLink The invite link to check
+ * @param {Object} redisClient Redis client
  * @returns {Promise<Object>} Invite status and ID
  */
-const checkInviteLink = async (inviteLink) => {
+const checkInviteLink = async (inviteLink, redisClient) => {
   try {
-    const invite = await DriverInvite.findOne({ inviteLink });
+    const inviteId = await redisClient.get(`invitelink:${inviteLink}`);
     
-    if (!invite) {
+    if (!inviteId) {
       return { isValid: false, inviteId: null };
     }
     
+    const invite = await redisClient.hGetAll(`invite:${inviteId}`);
+    
     // Check if invite is expired
-    if (invite.status === 'expired' || (invite.expiresAt && new Date() > invite.expiresAt)) {
+    if (invite.status === 'expired' || (invite.expiresAt && new Date() > new Date(parseInt(invite.expiresAt)))) {
       return { isValid: false, inviteId: null };
     }
     
@@ -71,7 +72,7 @@ const checkInviteLink = async (inviteLink) => {
       return { isValid: false, inviteId: null };
     }
     
-    return { isValid: true, inviteId: invite._id };
+    return { isValid: true, inviteId };
   } catch (error) {
     console.error('Error checking invite link:', error);
     return { isValid: false, inviteId: null };
@@ -81,18 +82,18 @@ const checkInviteLink = async (inviteLink) => {
 /**
  * Mark an invite link as used
  * @param {String} inviteId The invite ID
+ * @param {Object} redisClient Redis client
  * @returns {Promise<Boolean>} Success status
  */
-const markInviteLinkAsUsed = async (inviteId) => {
+const markInviteLinkAsUsed = async (inviteId, redisClient) => {
   try {
-    const invite = await DriverInvite.findById(inviteId);
+    const inviteExists = await redisClient.exists(`invite:${inviteId}`);
     
-    if (!invite) {
+    if (!inviteExists) {
       return false;
     }
     
-    invite.status = 'used';
-    await invite.save();
+    await redisClient.hSet(`invite:${inviteId}`, 'status', 'used');
     
     return true;
   } catch (error) {
@@ -106,24 +107,26 @@ const markInviteLinkAsUsed = async (inviteId) => {
  * @param {Number} userId User's Telegram ID
  * @param {String} inviteId The invite ID
  * @param {Function} createInviteLink Function to create invite link
+ * @param {Object} redisClient Redis client
  * @returns {Promise<Object>} Success status and message
  */
-const confirmPaymentAndCreateInvite = async (userId, inviteId, createInviteLink) => {
+const confirmPaymentAndCreateInvite = async (userId, inviteId, createInviteLink, redisClient) => {
   try {
-    const user = await User.findOne({ telegramId: userId });
+    const user = await redisClient.hGetAll(`user:${userId}`);
     
-    if (!user) {
+    if (Object.keys(user).length === 0) {
       return { success: false, message: 'User not found' };
     }
     
     // Update user payment status
-    user.paymentStatus = "approved";
-    user.lastInteraction = new Date(); // Reset the timer for 15 seconds
-    await user.save();
+    await redisClient.hSet(`user:${userId}`, {
+      paymentStatus: 'approved',
+      lastInteraction: Date.now().toString()
+    });
     
     // Mark the invite as used
     if (inviteId) {
-      await markInviteLinkAsUsed(inviteId);
+      await markInviteLinkAsUsed(inviteId, redisClient);
     }
     
     return { success: true, message: 'Payment confirmed' };
@@ -138,4 +141,4 @@ module.exports = {
   checkInviteLink,
   markInviteLinkAsUsed,
   confirmPaymentAndCreateInvite
-}; 
+};

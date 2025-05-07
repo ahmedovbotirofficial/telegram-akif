@@ -1,18 +1,13 @@
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
-const mongoose = require('mongoose');
+const Redis = require('redis');
 const config = require('./config/config');
 const inviteController = require('./controllers/inviteController');
-const User = require('./models/User');
 const membershipUtils = require('./utils/membershipUtils');
-const DriverInvite = require('./models/DriverInvite');
 const fileUtils = require('./utils/fileUtils');
-const path = require('path');
-const fs = require('fs');
 const express = require('express');
 const app = express();
 const messagesApi = require('./api/messages');
-const GroupMessage = require('./models/GroupMessage');
 
 // Bot token
 const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -32,13 +27,62 @@ bot.getMe().then(info => {
   console.error('Error getting bot info:', err);
 });
 
-// Connect to MongoDB
-mongoose.connect(process.env.MONGODB_URI)
-  .then(() => console.log('Connected to MongoDB'))
-  .catch(err => console.error('MongoDB connection error:', err));
+// Connect to Redis
+const redisClient = Redis.createClient({
+  url: process.env.REDIS_URI
+});
+
+redisClient.on('error', (err) => console.error('Redis Client Error:', err));
+redisClient.on('connect', () => console.log('Connected to Redis'));
+
+(async () => {
+  await redisClient.connect();
+})();
 
 // Admin ID
 const ADMIN_ID = 1543822491;
+
+// Utility function to get user from Redis
+const getUser = async (telegramId) => {
+  const userData = await redisClient.hGetAll(`user:${telegramId}`);
+  if (Object.keys(userData).length === 0) return null;
+  return {
+    telegramId: parseInt(userData.telegramId),
+    username: userData.username || undefined,
+    firstName: userData.firstName || undefined,
+    lastName: userData.lastName || undefined,
+    role: userData.role || 'undefined',
+    fullName: userData.fullName || undefined,
+    phoneNumber: userData.phoneNumber || undefined,
+    state: userData.state || 'normal',
+    paymentStatus: userData.paymentStatus || 'none',
+    createdAt: userData.createdAt ? new Date(parseInt(userData.createdAt)) : undefined,
+    updatedAt: userData.updatedAt ? new Date(parseInt(userData.updatedAt)) : undefined,
+    lastInteraction: userData.lastInteraction ? new Date(parseInt(userData.lastInteraction)) : undefined,
+    countdownIntervalId: userData.countdownIntervalId ? parseInt(userData.countdownIntervalId) : undefined
+  };
+};
+
+// Utility function to save user to Redis
+const saveUser = async (user) => {
+  const userData = {
+    telegramId: user.telegramId.toString(),
+    username: user.username || '',
+    firstName: user.firstName || '',
+    lastName: user.lastName || '',
+    role: user.role || 'undefined',
+    fullName: user.fullName || '',
+    phoneNumber: user.phoneNumber || '',
+    state: user.state || 'normal',
+    paymentStatus: user.paymentStatus || 'none',
+    createdAt: user.createdAt ? user.createdAt.getTime().toString() : Date.now().toString(),
+    updatedAt: user.updatedAt ? user.updatedAt.getTime().toString() : Date.now().toString(),
+    lastInteraction: user.lastInteraction ? user.lastInteraction.getTime().toString() : Date.now().toString(),
+    countdownIntervalId: user.countdownIntervalId ? user.countdownIntervalId.toString() : ''
+  };
+  await redisClient.hSet(`user:${user.telegramId}`, userData);
+  await redisClient.sAdd('users', user.telegramId.toString());
+};
 
 // Handle /start command
 bot.onText(/\/start/, async (msg) => {
@@ -52,16 +96,20 @@ bot.onText(/\/start/, async (msg) => {
 
   try {
     // Check if user exists
-    let user = await User.findOne({ telegramId: chatId });
+    let user = await getUser(chatId);
 
     if (!user) {
       // Create new user
-      user = new User({ 
+      user = {
         telegramId: chatId,
         firstName: firstName,
-        username: msg.from.username
-      });
-      await user.save();
+        username: msg.from.username,
+        role: 'undefined',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        lastInteraction: new Date()
+      };
+      await saveUser(user);
 
       // Send welcome message with role selection keyboard
       const options = {
@@ -169,7 +217,7 @@ bot.on('message', async (msg) => {
 
   if (text === "Foydalanuvchi" || text === "Haydovchi") {
     try {
-      const user = await User.findOne({ telegramId: chatId });
+      const user = await getUser(chatId);
       
       if (!user) {
         return await bot.sendMessage(chatId, 'Xatolik yuz berdi. Iltimos, /start buyrug\'ini bosing.');
@@ -177,7 +225,7 @@ bot.on('message', async (msg) => {
 
       // Update user role
       user.role = text === "Foydalanuvchi" ? "user" : "driver";
-      await user.save();
+      await saveUser(user);
 
       if (user.role === "user") {
         // Mini App keyboard
@@ -219,7 +267,7 @@ bot.on('message', async (msg) => {
       } else {
         // Driver registration process
         user.state = "waiting_fullname";
-        await user.save();
+        await saveUser(user);
 
         const driverKeyboard = {
           reply_markup: {
@@ -254,13 +302,13 @@ bot.on('message', async (msg) => {
   }
 
   try {
-    const user = await User.findOne({ telegramId: chatId });
+    const user = await getUser(chatId);
 
     if (!user || user.role !== "driver") return;
 
     if (text === "Bekor qilish") {
       user.state = "normal";
-      await user.save();
+      await saveUser(user);
       
       const options = {
         reply_markup: {
@@ -282,7 +330,7 @@ bot.on('message', async (msg) => {
     if (user.state === "waiting_fullname") {
       user.fullName = text;
       user.state = "waiting_phone";
-      await user.save();
+      await saveUser(user);
 
       const phoneKeyboard = {
         reply_markup: {
@@ -304,7 +352,7 @@ bot.on('message', async (msg) => {
       if (msg.contact) {
         user.phoneNumber = msg.contact.phone_number;
         user.state = "normal";
-        await user.save();
+        await saveUser(user);
 
         try {
           // Check if user is in the group
@@ -327,7 +375,7 @@ bot.on('message', async (msg) => {
           }
 
           // Create one-time invite link
-          const inviteLink = await inviteController.createTrialInviteLink(bot, chatId, user.fullName);
+          const inviteLink = await inviteController.createTrialInviteLink(bot, chatId, user.fullName, redisClient);
           
           if (inviteLink) {
             const keyboard = {
@@ -400,20 +448,22 @@ bot.on('message', async (msg) => {
     if (msg.chat.id.toString() === config.telegramChatId) {
       console.log('Received group message:', msg.message_id); // Debug log
       
-      // Save message to database
-      const groupMessage = new GroupMessage({
-        messageId: msg.message_id,
-        chatId: msg.chat.id,
-        userId: msg.from.id,
-        username: msg.from.username,
-        firstName: msg.from.first_name,
-        lastName: msg.from.last_name,
+      // Save message to Redis
+      const groupMessage = {
+        messageId: msg.message_id.toString(),
+        chatId: msg.chat.id.toString(),
+        userId: msg.from.id.toString(),
+        username: msg.from.username || '',
+        firstName: msg.from.first_name || '',
+        lastName: msg.from.last_name || '',
         text: msg.text || '',
-        date: new Date(msg.date * 1000)
-      });
+        date: (new Date(msg.date * 1000)).getTime().toString(),
+        createdAt: Date.now().toString()
+      };
 
-      await groupMessage.save();
-      console.log('Saved group message:', groupMessage._id); // Debug log
+      await redisClient.hSet(`groupmessage:${msg.message_id}`, groupMessage);
+      await redisClient.sAdd('groupmessages', msg.message_id.toString());
+      console.log('Saved group message:', msg.message_id); // Debug log
     }
   } catch (error) {
     console.error('Error saving group message:', error);
@@ -427,7 +477,7 @@ bot.on('message', async (msg) => {
 
   if (text === "Guruhga qo'shilish") {
     try {
-      const user = await User.findOne({ telegramId: chatId });
+      const user = await getUser(chatId);
 
       if (!user || user.role !== "driver") {
         return await bot.sendMessage(chatId, "Bu funksiya faqat haydovchilar uchun mavjud.");
@@ -452,7 +502,7 @@ bot.on('message', async (msg) => {
       }
 
       if (user.paymentStatus === "approved") {
-        const inviteLink = await inviteController.createPaymentInviteLink(bot, chatId);
+        const inviteLink = await inviteController.createPaymentInviteLink(bot, chatId, null, redisClient);
         
         if (inviteLink) {
           const keyboard = {
@@ -471,7 +521,7 @@ bot.on('message', async (msg) => {
         }
       } else if (user.paymentStatus === "none") {
         // Create a new trial invite link
-        const inviteLink = await inviteController.createTrialInviteLink(bot, chatId, user.fullName);
+        const inviteLink = await inviteController.createTrialInviteLink(bot, chatId, user.fullName, redisClient);
         
         if (inviteLink) {
           const keyboard = {
@@ -510,19 +560,29 @@ bot.on('new_chat_members', async (msg) => {
     for (const member of newMembers) {
       if (member.id === bot.botId) continue; // Skip if the new member is the bot itself
 
-      const user = await User.findOne({ telegramId: member.id });
+      const user = await getUser(member.id);
       if (!user || user.role !== "driver") continue; // Skip if not a registered driver
 
-      // Find and mark the invite link as used
-      const invite = await DriverInvite.findOne({
-        telegramId: member.id,
-        status: 'active',
-        type: 'trial'
-      });
+      // Find active trial invite
+      const inviteIds = await redisClient.sMembers(`invites:user:${member.id}`);
+      let invite = null;
+      for (const inviteId of inviteIds) {
+        const inv = await redisClient.hGetAll(`invite:${inviteId}`);
+        if (inv.status === 'active' && inv.type === 'trial') {
+          invite = {
+            id: inviteId,
+            ...inv,
+            telegramId: parseInt(inv.telegramId),
+            createdAt: new Date(parseInt(inv.createdAt)),
+            expiresAt: inv.expiresAt ? new Date(parseInt(inv.expiresAt)) : undefined
+          };
+          break;
+        }
+      }
 
       if (invite) {
-        invite.status = 'used';
-        await invite.save();
+        // Mark invite as used
+        await redisClient.hSet(`invite:${invite.id}`, 'status', 'used');
 
         // Send welcome message first
         await bot.sendMessage(
@@ -572,7 +632,7 @@ bot.on('new_chat_members', async (msg) => {
 
         // Store the interval ID in the user object for later cleanup if needed
         user.countdownIntervalId = countdownInterval;
-        await user.save();
+        await saveUser(user);
       }
     }
   } catch (error) {
@@ -592,14 +652,14 @@ bot.on('message', async (msg) => {
 
   if (text === "To'lov") {
     try {
-      const user = await User.findOne({ telegramId: chatId });
+      const user = await getUser(chatId);
 
       if (!user || user.role !== "driver") {
         return await bot.sendMessage(chatId, "Bu funksiya faqat haydovchilar uchun mavjud.");
       }
 
       // Check if user is in trial period
-      const trialStatus = await membershipUtils.checkTrialPeriod(chatId);
+      const trialStatus = await membershipUtils.checkTrialPeriod(chatId, redisClient);
       if (trialStatus.isTrialActive) {
         return await bot.sendMessage(
           chatId,
@@ -609,7 +669,7 @@ bot.on('message', async (msg) => {
 
       // Set user state to waiting for payment photo
       user.state = "waiting_payment_photo";
-      await user.save();
+      await saveUser(user);
 
       const paymentKeyboard = {
         reply_markup: {
@@ -646,7 +706,7 @@ bot.on('photo', async (msg) => {
   }
 
   try {
-    const user = await User.findOne({ telegramId: chatId });
+    const user = await getUser(chatId);
 
     if (!user || user.role !== "driver") {
       return await bot.sendMessage(chatId, "Bu funksiya faqat haydovchilar uchun mavjud.");
@@ -658,14 +718,14 @@ bot.on('photo', async (msg) => {
 
     const photoId = msg.photo[msg.photo.length - 1].file_id;
 
-    // Rasmni saqlash
+    // Save payment photo
     const savedPhotoPath = await fileUtils.saveTelegramPhoto(bot, photoId, chatId);
     console.log(`To'lov cheki saqlandi: ${savedPhotoPath}`);
 
     // Set payment status to pending
     user.paymentStatus = "pending";
     user.state = "normal";
-    await user.save();
+    await saveUser(user);
 
     const driverKeyboard = {
       reply_markup: {
@@ -695,7 +755,7 @@ bot.on('message', async (msg) => {
 
   if (text === "Status") {
     try {
-      const user = await User.findOne({ telegramId: chatId });
+      const user = await getUser(chatId);
       
       if (!user) {
         return await bot.sendMessage(chatId, "Foydalanuvchi topilmadi. Iltimos, /start buyrug'ini bosing.");
@@ -707,7 +767,7 @@ bot.on('message', async (msg) => {
       
       if (user.role === "driver") {
         // Check trial status
-        const trialStatus = await membershipUtils.checkTrialPeriod(chatId);
+        const trialStatus = await membershipUtils.checkTrialPeriod(chatId, redisClient);
         
         if (trialStatus.isTrialActive) {
           statusMessage += `⏱️ Guruhda qolish muddati: ${trialStatus.secondsLeft} sekund qoldi\n`;
@@ -756,11 +816,17 @@ bot.on('message', async (msg) => {
 
   try {
     switch (text) {
-      case "Statistika":
-        const totalUsers = await User.countDocuments({ role: "user" });
-        const totalDrivers = await User.countDocuments({ role: "driver" });
-        const approvedPayments = await User.countDocuments({ role: "driver", paymentStatus: "approved" });
-        const pendingPayments = await User.countDocuments({ role: "driver", paymentStatus: "pending" });
+      case "Statistika": {
+        const statsUserIds = await redisClient.sMembers('users');
+        let totalUsers = 0, totalDrivers = 0, approvedPayments = 0, pendingPayments = 0;
+
+        for (const userId of statsUserIds) {
+          const user = await getUser(parseInt(userId));
+          if (user.role === "user") totalUsers++;
+          if (user.role === "driver") totalDrivers++;
+          if (user.role === "driver" && user.paymentStatus === "approved") approvedPayments++;
+          if (user.role === "driver" && user.paymentStatus === "pending") pendingPayments++;
+        }
 
         const statsMessage = `📊 Statistika:\n\n` +
           `👥 Foydalanuvchilar: ${totalUsers}\n` +
@@ -770,8 +836,9 @@ bot.on('message', async (msg) => {
 
         await bot.sendMessage(chatId, statsMessage);
         break;
+      }
 
-      case "Xabar yuborish":
+      case "Xabar yuborish": {
         const messageKeyboard = {
           reply_markup: {
             keyboard: [
@@ -784,25 +851,29 @@ bot.on('message', async (msg) => {
         };
         await bot.sendMessage(chatId, "Xabar yubormoqchi bo'lgan guruhni tanlang:", messageKeyboard);
         break;
+      }
 
       case "Foydalanuvchilarga":
       case "Haydovchilarga":
-      case "Hammaga":
+      case "Hammaga": {
         // Store the target group in user state
         const targetGroup = text === "Foydalanuvchilarga" ? "user" : 
-                          text === "Haydovchilarga" ? "driver" : "all";
+                           text === "Haydovchilarga" ? "driver" : "all";
         
-        // Create a temporary user object for admin to store state
-        let adminUser = await User.findOne({ telegramId: chatId });
+        // Create or update admin user
+        let adminUser = await getUser(chatId);
         if (!adminUser) {
-          adminUser = new User({ 
+          adminUser = {
             telegramId: chatId,
             firstName: msg.from.first_name,
-            role: "admin"
-          });
+            role: "admin",
+            createdAt: new Date(),
+            updatedAt: new Date(),
+            lastInteraction: new Date()
+          };
         }
         adminUser.state = `waiting_message_${targetGroup}`;
-        await adminUser.save();
+        await saveUser(adminUser);
 
         const backKeyboard = {
           reply_markup: {
@@ -819,8 +890,9 @@ bot.on('message', async (msg) => {
           backKeyboard
         );
         break;
+      }
 
-      case "Orqaga":
+      case "Orqaga": {
         const adminKeyboard = {
           reply_markup: {
             keyboard: [
@@ -834,25 +906,37 @@ bot.on('message', async (msg) => {
         };
         await bot.sendMessage(chatId, "Admin panel:", adminKeyboard);
         break;
+      }
 
-      case "To'lovlarni tasdiqlash":
-        const pendingUsers = await User.find({ role: "driver", paymentStatus: "pending" });
+      case "To'lovlarni tasdiqlash": {
+        const pendingUserIds = await redisClient.sMembers('users');
+        const pendingUsers = [];
+        
+        for (const userId of pendingUserIds) {
+          const user = await getUser(parseInt(userId));
+          if (user.role === "driver" && user.paymentStatus === "pending") {
+            pendingUsers.push(user);
+          }
+        }
         
         if (pendingUsers.length === 0) {
           await bot.sendMessage(chatId, "Tekshirilishi kerak bo'lgan to'lovlar yo'q.");
           return;
         }
 
+        const fs = require('fs').promises;
+        const path = require('path');
+
         for (const user of pendingUsers) {
           // Get payment receipt path
-          const userDir = path.join(__dirname, 'uploads', 'payments', user.telegramId.toString());
+          const userDir = path.join(__dirname, 'Uploads', 'payments', user.telegramId.toString());
           
           try {
             // Check if directory exists
-            await fs.promises.access(userDir);
+            await fs.access(userDir);
             
             // Read directory contents
-            const files = await fs.promises.readdir(userDir);
+            const files = await fs.readdir(userDir);
             
             if (files.length > 0) {
               // Get the most recent file
@@ -894,9 +978,16 @@ bot.on('message', async (msg) => {
           }
         }
         break;
+      }
 
-      case "Foydalanuvchilar ro'yxati":
-        const users = await User.find({ role: "user" });
+      case "Foydalanuvchilar ro'yxati": {
+        const usersUserIds = await redisClient.sMembers('users');
+        const users = [];
+        
+        for (const userId of usersUserIds) {
+          const user = await getUser(parseInt(userId));
+          if (user.role === "user") users.push(user);
+        }
         
         if (users.length === 0) {
           await bot.sendMessage(chatId, "Foydalanuvchilar ro'yxati bo'sh.");
@@ -912,9 +1003,16 @@ bot.on('message', async (msg) => {
 
         await bot.sendMessage(chatId, usersMessage);
         break;
+      }
 
-      case "Haydovchilar ro'yxati":
-        const drivers = await User.find({ role: "driver" });
+      case "Haydovchilar ro'yxati": {
+        const driversUserIds = await redisClient.sMembers('users');
+        const drivers = [];
+        
+        for (const userId of driversUserIds) {
+          const user = await getUser(parseInt(userId));
+          if (user.role === "driver") drivers.push(user);
+        }
         
         if (drivers.length === 0) {
           await bot.sendMessage(chatId, "Haydovchilar ro'yxati bo'sh.");
@@ -932,6 +1030,7 @@ bot.on('message', async (msg) => {
 
         await bot.sendMessage(chatId, driversMessage);
         break;
+      }
     }
   } catch (error) {
     console.error('Error in admin command:', error);
@@ -946,7 +1045,7 @@ bot.on('callback_query', async (query) => {
 
   try {
     const [action, userId] = query.data.split('_');
-    const user = await User.findOne({ telegramId: parseInt(userId) });
+    const user = await getUser(parseInt(userId));
 
     if (!user) {
       await bot.answerCallbackQuery(query.id, "Foydalanuvchi topilmadi!");
@@ -955,7 +1054,8 @@ bot.on('callback_query', async (query) => {
 
     if (action === "approve") {
       user.paymentStatus = "approved";
-      await user.save();
+      user.lastInteraction = new Date(); // Reset timer
+      await saveUser(user);
 
       // Delete the payment confirmation message
       await bot.deleteMessage(chatId, query.message.message_id);
@@ -967,7 +1067,7 @@ bot.on('callback_query', async (query) => {
       );
 
       // Create new invite link for the driver
-      const inviteLink = await inviteController.createPaymentInviteLink(bot, user.telegramId);
+      const inviteLink = await inviteController.createPaymentInviteLink(bot, user.telegramId, null, redisClient);
       
       if (inviteLink) {
         const keyboard = {
@@ -1012,13 +1112,13 @@ bot.on('callback_query', async (query) => {
 
         // Store the interval ID in the user object for later cleanup if needed
         user.countdownIntervalId = countdownInterval;
-        await user.save();
+        await saveUser(user);
       }
 
       await bot.answerCallbackQuery(query.id, "To'lov tasdiqlandi!");
     } else if (action === "reject") {
       user.paymentStatus = "none";
-      await user.save();
+      await saveUser(user);
 
       // Delete the payment confirmation message
       await bot.deleteMessage(chatId, query.message.message_id);
@@ -1047,7 +1147,7 @@ bot.on('message', async (msg) => {
   }
 
   try {
-    const adminUser = await User.findOne({ telegramId: chatId });
+    const adminUser = await getUser(chatId);
     if (!adminUser || !adminUser.state?.startsWith('waiting_message_')) {
       return;
     }
@@ -1056,12 +1156,12 @@ bot.on('message', async (msg) => {
     let users = [];
 
     // Get target users based on group
-    if (targetGroup === 'user') {
-      users = await User.find({ role: "user" });
-    } else if (targetGroup === 'driver') {
-      users = await User.find({ role: "driver" });
-    } else if (targetGroup === 'all') {
-      users = await User.find({});
+    const broadcastUserIds = await redisClient.sMembers('users');
+    for (const userId of broadcastUserIds) {
+      const user = await getUser(parseInt(userId));
+      if (targetGroup === 'user' && user.role === 'user') users.push(user);
+      else if (targetGroup === 'driver' && user.role === 'driver') users.push(user);
+      else if (targetGroup === 'all') users.push(user);
     }
 
     // Send message to all target users
@@ -1095,7 +1195,7 @@ bot.on('message', async (msg) => {
 
     // Reset admin state
     adminUser.state = "normal";
-    await adminUser.save();
+    await saveUser(adminUser);
 
     // Send summary to admin
     const summaryMessage = `📨 Xabar yuborish natijasi:\n\n` +
@@ -1131,4 +1231,4 @@ app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
 });
 
-console.log('Bot is running...'); 
+console.log('Bot is running...');
